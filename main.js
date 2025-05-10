@@ -1,5 +1,3 @@
-
-
 const ACTION_SPIN_MULTIPLIER = 7;
 
 const action_names = {
@@ -43,7 +41,7 @@ var action_manager = {
 
 		if (dagger.action == "spin") {
 			blade.spin *= ACTION_SPIN_MULTIPLIER;
-			
+
 			setTimeout(function() {
 				if (game_num_2 != game_num) {
 					return;
@@ -532,6 +530,168 @@ const config = {
 	sync_id: "1@",
 }
 
+var enemies = [];
+var wave_num = null;
+let otherPlayers = {}; // Object to store other players' graphics
+var socket; // Declare socket globally for WebSocket
+var myPlayerId; // ADDED: Store the ID of the local player
+
+const WEBSOCKET_SERVER_URL = 'ws://localhost:8080';
+
+function connectToServer(mapId) {
+	socket = new WebSocket(WEBSOCKET_SERVER_URL);
+
+	socket.onopen = function() {
+		console.log('Connected to WebSocket server.');
+		// Send initial position along with join_map request
+		let initialX = (typeof me !== 'undefined' && me.cont) ? me.cont.position.x : 200; // Default if 'me' is not ready
+		let initialY = (typeof me !== 'undefined' && me.cont) ? me.cont.position.y : 200; // Default if 'me' is not ready
+
+        // Attempt to retrieve a previously assigned player ID from localStorage
+        let previousPlayerId = localStorage.getItem('myPlayerId_orbitaldaggers');
+        console.log("Attempting to join with requestedPlayerId:", previousPlayerId);
+
+		socket.send(JSON.stringify({
+			type: "join_map",
+			map_id: mapId,
+			initialX: initialX,
+			initialY: initialY,
+            requestedPlayerId: previousPlayerId // Send previous ID if available
+		}));
+	};
+
+	socket.onmessage = function(event) {
+		console.log("Message from server: ", event.data);
+		try {
+			const message = JSON.parse(event.data);
+
+			if (message.type === "welcome") {
+				console.log("Server says: " + message.message);
+			} else if (message.type === "player_joined") {
+				console.log("Player joined message received: ", message);
+                // Ensure we don't try to add the local player as an "otherPlayer"
+                // And ensure the player isn't already added
+				if (message.playerId && message.playerId !== myPlayerId && !otherPlayers[message.playerId]) {
+					console.log(`Attempting to add new player: ${message.playerId} with data:`, message.playerData);
+                    // message.playerData should contain x, y, and potentially other state
+                    const initialPlayerData = message.playerData || { x: 200, y: 200 }; // Provide default if playerData is missing
+
+					if (typeof app !== 'undefined' && app && app.stage && typeof OnlinePlayer === 'function') {
+						const newPlayer = new OnlinePlayer(message.playerId, initialPlayerData);
+						otherPlayers[message.playerId] = newPlayer;
+						// OnlinePlayer constructor should handle adding to stage and sorting
+						console.log(`OnlinePlayer ${message.playerId} instance created. Current otherPlayers:`, Object.keys(otherPlayers));
+					} else {
+						console.error('PIXI app/stage not ready or OnlinePlayer class not found for player_joined:', message.playerId, "App:", app, "App.stage:", (app ? app.stage : 'app is undefined'), "OnlinePlayer type:", typeof OnlinePlayer);
+                        // Fallback to simple graphic if OnlinePlayer class is not available
+                        // This part might be removed if OnlinePlayer is guaranteed to be defined.
+                        const playerGraphic = new PIXI.Graphics();
+                        playerGraphic.beginFill(0xDE3249); // Example color
+                        playerGraphic.drawCircle(0, 0, 20); // Example size
+                        playerGraphic.endFill();
+                        playerGraphic.x = initialPlayerData.x;
+                        playerGraphic.y = initialPlayerData.y;
+                        app.stage.addChild(playerGraphic);
+                        otherPlayers[message.playerId] = playerGraphic;
+                        app.stage.sortChildren();
+
+					}
+				} else if (message.playerId === myPlayerId) {
+                    // console.log("Ignoring player_joined message for self.");
+                } else if (otherPlayers[message.playerId]) {
+					console.log(`Player ${message.playerId} already exists in otherPlayers. No new instance created.`);
+				} else if (!message.playerId) {
+					console.error("player_joined message received without a playerId:", message);
+				}
+			} else if (message.type === "player_left") {
+				console.log("Player left: ", message.playerId);
+				if (message.playerId && message.playerId !== myPlayerId && otherPlayers[message.playerId]) {
+					if (otherPlayers[message.playerId] instanceof OnlinePlayer) {
+						otherPlayers[message.playerId].delete(); // Use the class's delete method
+					} else if (typeof app !== 'undefined' && app && app.stage && typeof app.stage.removeChild === 'function' && otherPlayers[message.playerId] && typeof otherPlayers[message.playerId].destroy === 'function') {
+                        // Fallback for simple graphics
+						app.stage.removeChild(otherPlayers[message.playerId]);
+						otherPlayers[message.playerId].destroy();
+					} else {
+                        console.error('Error removing player graphic for player_left:', message.playerId, "Player object:", otherPlayers[message.playerId]);
+                    }
+					delete otherPlayers[message.playerId];
+                    console.log(`Player ${message.playerId} removed. Current otherPlayers:`, Object.keys(otherPlayers));
+				}
+			} else if (message.type === "game_state_update") {
+				 // Handle game state update for player positions
+				// console.log("Game state update received: ", message.playerData); // Can be very noisy
+				if (message.playerData && message.playerData.id && message.playerData.id !== myPlayerId && otherPlayers[message.playerData.id]) {
+					// console.log(`Updating state for player ${message.playerData.id}`);
+                    if (otherPlayers[message.playerData.id] instanceof OnlinePlayer) {
+                        otherPlayers[message.playerData.id].update_state(message.playerData);
+                    } else {
+                        // Fallback for simple graphics
+                        if (message.playerData.x !== undefined) otherPlayers[message.playerData.id].x = message.playerData.x;
+                        if (message.playerData.y !== undefined) otherPlayers[message.playerData.id].y = message.playerData.y;
+                    }
+				} else {
+					// This log can be noisy if a player_update for the local player is somehow echoed back
+					// or if a player leaves and an update arrives late.
+                    // if (message.playerData && message.playerData.id !== myPlayerId) {
+					//    console.warn("Could not update player graphic: ", message.playerData, "Current otherPlayers:", Object.keys(otherPlayers));
+                    // }
+				}
+			} else if (message.type === "map_joined_ack") {
+				console.log(`Successfully joined map: ${message.map_id}. Your ID: ${message.yourId}. Existing players:`, message.existingPlayers);
+				myPlayerId = message.yourId; // Store my ID
+                localStorage.setItem('myPlayerId_orbitaldaggers', myPlayerId); // Save confirmed ID to localStorage
+
+				if (message.status === "success" && message.map_id) {
+                    // Clear existing otherPlayers before populating from ack, in case of re-join or state issues
+                    for (const playerId in otherPlayers) {
+                        if (otherPlayers[playerId] instanceof OnlinePlayer) {
+                            otherPlayers[playerId].delete();
+                        }
+                        delete otherPlayers[playerId];
+                    }
+                    console.log("Cleared otherPlayers before populating from map_joined_ack.");
+
+                    // Populate otherPlayers from existingPlayers list
+                    if (message.existingPlayers && Array.isArray(message.existingPlayers)) {
+                        message.existingPlayers.forEach(playerInfo => {
+                            if (playerInfo.playerId && playerInfo.playerId !== myPlayerId && !otherPlayers[playerInfo.playerId]) {
+                                console.log(`Adding existing player from ack: ${playerInfo.playerId} with data:`, playerInfo.playerData);
+                                const initialPlayerData = playerInfo.playerData || { x: 200, y: 200, hp: 100 }; // Ensure defaults
+                                if (typeof app !== 'undefined' && app && app.stage && typeof OnlinePlayer === 'function') {
+                                    const newPlayer = new OnlinePlayer(playerInfo.playerId, initialPlayerData);
+                                    otherPlayers[playerInfo.playerId] = newPlayer;
+                                } else {
+                                    console.error('PIXI app/stage not ready or OnlinePlayer class not found for existing player:', playerInfo.playerId);
+                                }
+                            }
+                        });
+                    }
+                    console.log("Initial otherPlayers populated from ack:", Object.keys(otherPlayers));
+
+					// Call the function to load and start the map
+					state.set("playing", {map_id: message.map_id});
+				} else {
+					console.error("Failed to join map or map_id missing:", message);
+					// Optionally, handle the failure, e.g., show an error message to the user
+				}
+			} else if (message.type === "error") {
+				console.error("Server error message: " + message.message);
+			}
+		} catch (e) {
+			console.error("Error processing message from server:", e, "Raw data:", event.data);
+		}
+	};
+
+	socket.onclose = function() {
+		console.log('Disconnected from WebSocket server.');
+		// Optionally, you might want to nullify otherPlayers or handle reconnection logic
+	};
+
+	socket.onerror = function(error) {
+		console.error('WebSocket Error: ', error);
+	};
+}
 
 
 var controls = {
@@ -1103,31 +1263,17 @@ class Enemy {
 	}
 	
 }
-function hp_color(hp) {
-	if (hp <= 100) {
+function hp_color(hp, hp_max) { // Modified to potentially use hp_max if logic changes
+	// Current logic only uses hp. If hp_max is needed for color, adjust here.
+	// For now, it behaves as hp_color(hp)
+	let display_hp = hp; // Could be hp / hp_max * 100 if color depends on percentage of a fixed scale
+	if (display_hp <= 100) { // Assuming this scale is somewhat absolute or a normalized range
 		return 0x00ff00;
-	} else if (hp <= 200) {
+	} else if (display_hp <= 200) {
 		return 0x00ff22;
 	} else {
 		return 0xffff00;
 	}
-
-
-
-	// function rgbToHex(r, g, b) {
-	//   return "#" + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1);
-	// }
-
-	// function n_to_color(n) {
-	// 	n -= 255;
-	// 	if (n < 0) {
-	// 		return rgbToHex(-n, 255, 0);
-	// 	} else {
-	// 		return rgbToHex(0, 255, n);
-	// 	}
-	// }
-	// // 0 - 510
-	// return n_to_color(hp / 100);
 }
 
 
@@ -1417,6 +1563,9 @@ var map_info = [{
 }, {
 	id: "map18",
 	msg: false
+}, {
+	id: "map19",
+	msg: false
 }]
 
 
@@ -1430,6 +1579,16 @@ var motion = {
 		for (let next_pos of next_pos_options) {
 			if (this.is_in_bounds(next_pos)) {
 				me.move_to(next_pos);
+				// Send position update to server
+				if (socket && socket.readyState === WebSocket.OPEN && state.playing) {
+					socket.send(JSON.stringify({
+						type: 'player_update',
+						data: {
+							x: me.cont.position.x,
+							y: me.cont.position.y
+						}
+					}));
+				}
 				break;
 			}
 		}
@@ -1537,30 +1696,11 @@ var news = {
 	}
 }
 
-
-
-
-
-
-
-//   "host_permissions": [
-//     "https://www.google.com/"
-//   ],
-
-
-// chrome.runtime.sendMessage(
-//     {contentScriptQuery: 'fetchUrl',
-//      url: 'https://another-site.com/price-query?itemId=' +
-//               encodeURIComponent(request.itemId)},
-//     response => parsePrice(response.text()));
-
-
-
-
 class Player {
 	constructor(data) {
 		this.cont = new PIXI.Container();
 		app.stage.addChild(this.cont);
+		this.cont.zIndex = 10; // Set zIndex for local player
 
 		this.hp = 100;
 		this.hp_max = 100;
@@ -1586,7 +1726,7 @@ class Player {
 
 
 		this.hpsprite = new PIXI.Graphics();
-		this.hpsprite.beginFill(hp_color(this.hp));
+		this.hpsprite.beginFill(hp_color(this.hp, this.hp_max)); // Pass both for consistency, though current hp_color might only use hp
 		this.hpsprite.drawRect(0, 0, 40, 7);
 		this.hpsprite.endFill();
 		this.hpsprite.scale.set(1, 1);
@@ -1682,10 +1822,123 @@ class Player {
 
 	delete() {
 	}
-	
+
 }
 
+class OnlinePlayer {
+    constructor(id, data = {}) { // data might come from server's player_joined message
+        this.id = id;
+        this.cont = new PIXI.Container();
+        this.cont.zIndex = 5; // Render below local player (me.cont.zIndex = 10 usually)
+        
 
+        this.hp = data.hp !== undefined ? data.hp : 100;
+        this.hp_max = data.hp_max !== undefined ? data.hp_max : 100;
+
+        // Visual representation (body)
+        let textures = [];
+        for (let i = 0; i < 4; i++) {
+            let texture = assets['p_' + i]; 
+            if (texture) {
+                textures.push(texture);
+            } else {
+                console.warn(`Texture assets['p_${i}'] not found for OnlinePlayer ${this.id}`);
+            }
+        }
+
+        if (textures.length === 4) { // Check if all frames for the animation are loaded
+            this.body = new PIXI.AnimatedSprite(textures);
+            this.body.loop = true;
+            this.body.animationSpeed = 0.2;
+            this.body.pivot.set(this.body.width / 2, this.body.height / 2);
+            this.body.play();
+            this.cont.addChild(this.body);
+        } else {
+            console.warn(`Could not load all animation frames for OnlinePlayer ${this.id} (expected 4, got ${textures.length}). Using fallback graphic.`);
+            this.body = new PIXI.Graphics();
+            this.body.beginFill(0x00DD00); // Bright Green for fallback
+            this.body.drawCircle(0, 0, 20); // Default size: radius 20
+            this.body.endFill();
+            this.cont.addChild(this.body);
+        }
+
+        // HP Bar
+        this.hpsprite = new PIXI.Graphics();
+        this.updateHpDisplay(); // Initial HP bar draw
+        this.hpsprite.pivot.set(40 / 2, -(7 + 3)); 
+        this.cont.addChild(this.hpsprite);
+
+        this.blades = []; 
+
+        const initialX = data.x !== undefined ? data.x : (typeof me !== 'undefined' && me && me.cont ? me.cont.position.x + (Math.random() * 60 - 30) : 250);
+        const initialY = data.y !== undefined ? data.y : (typeof me !== 'undefined' && me && me.cont ? me.cont.position.y + (Math.random() * 60 - 30) : 250);
+        this.move_to({ x: initialX, y: initialY });
+        
+        app.stage.addChild(this.cont); 
+        app.stage.sortChildren(); 
+
+        console.log(`OnlinePlayer ${this.id} created at x: ${this.cont.position.x}, y: ${this.cont.position.y}. HP: ${this.hp}/${this.hp_max}`);
+    }
+
+    updateHpDisplay() {
+        if (!this.hpsprite) return;
+        this.hpsprite.clear();
+        this.hpsprite.beginFill(hp_color(this.hp, this.hp_max)); 
+        const hpBarWidth = 40;
+        const hpBarHeight = 7;
+        this.hpsprite.drawRect(0, 0, hpBarWidth * (this.hp > 0 && this.hp_max > 0 ? (this.hp / this.hp_max) : 0), hpBarHeight);
+        this.hpsprite.endFill();
+    }
+
+    move_to(pos) {
+        if (!this.cont || pos.x === undefined || pos.y === undefined) return;
+        this.cont.position.x = pos.x;
+        this.cont.position.y = pos.y;
+    }
+
+    update_state(playerData) {
+        if (!this.cont) return; 
+
+        if (playerData.x !== undefined && playerData.y !== undefined) {
+            this.move_to({ x: playerData.x, y: playerData.y });
+        }
+        
+        let hpChanged = false;
+        if (playerData.hp !== undefined && this.hp !== playerData.hp) {
+            this.hp = playerData.hp;
+            hpChanged = true;
+        }
+        if (playerData.hp_max !== undefined && this.hp_max !== playerData.hp_max) { 
+            this.hp_max = playerData.hp_max;
+            hpChanged = true;
+        }
+        if (hpChanged) {
+            this.updateHpDisplay();
+        }
+    }
+    
+    update(delta) {
+    }
+
+    delete() {
+        if (this.cont) {
+            if (this.body && this.body instanceof PIXI.AnimatedSprite && this.body.playing) {
+                this.body.stop(); 
+            }
+            
+            if (app && app.stage) { 
+                app.stage.removeChild(this.cont);
+            }
+            
+            this.cont.destroy({ children: true, texture: false, baseTexture: false }); 
+            
+            this.cont = null; 
+            this.body = null;
+            this.hpsprite = null;
+        }
+        console.log(`OnlinePlayer ${this.id} removed and cleaned up.`);
+    }
+}
 
 var popup = {
 	init: async function() {
@@ -1725,6 +1978,9 @@ var popup = {
 		});
 		$("#settings_btn").click(function() {
 			state.set("settings");
+			});
+		$("#multiplayer_map19_btn").click(function() {
+			connectToServer("map19");
 		});
 
 		$("#death_respawn_btn").click(function() {
@@ -2074,9 +2330,11 @@ var wave_num = null;
 var start = {
 	init: function() {
 		app = maker.app();
+		app.stage.sortableChildren = true; // Enable zIndex sorting
 		bg_cont = new PIXI.Container();
 		app.stage.addChild(bg_cont);
 		me = new Player();
+		me.cont.zIndex = 10; // Set zIndex for local player
 
 	}
 }
